@@ -3,7 +3,8 @@
 import pyfits, os, sys
 import numpy
 
-sys.path.append("/work/podi_prep56")
+qr_dir = "/work/podi_prep56"
+sys.path.append(qr_dir)
 
 import podi_swarpstack
 from podi_commandline import *
@@ -38,7 +39,7 @@ def run_swarp(input_list, outputimage, combine="MEDIAN"):
         outputimage = outputimage[:-5]
 
     dic = {
-        'swarp_default': "/work/podi_devel/.config/swarp.default",
+        'swarp_default': "%s/.config/swarp.default" % (qr_dir),
         'img_out': "%s.fits" % (outputimage),
         'img_w_out': "%s.weight.fits" % (outputimage),
         'resample_dir': sitesetup.scratch_dir,
