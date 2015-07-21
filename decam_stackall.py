@@ -282,41 +282,73 @@ def do_work(hdulist, grpids, grpid):
             logger.warning("Only one source found in non-sidereal catalog!")
             nonsid_catalog = nonsid_catalog.reshape((1, -1))
 
-        elongated = nonsid_catalog[:, SXcolumn['elongation']] > 1.5
-        bad_photometry = nonsid_catalog[:, SXcolumn['mag_aper_2.0']] > 50.
-        flagged = nonsid_catalog[:, SXcolumn['flags']].astype(numpy.int8) > 0
-        bad = elongated | bad_photometry | flagged
-        _nonsid_catalog = nonsid_catalog[~bad]
-        print _nonsid_catalog
+        use_old_selection = False
+        if (use_old_selection):
+            elongated = nonsid_catalog[:, SXcolumn['elongation']] > 1.5
+            bad_photometry = nonsid_catalog[:, SXcolumn['mag_aper_2.0']] > 50.
+            flagged = nonsid_catalog[:, SXcolumn['flags']].astype(numpy.int8) > 0
+            bad = elongated | bad_photometry | flagged
+            _nonsid_catalog = nonsid_catalog[~bad]
+            print _nonsid_catalog
 
-        if (_nonsid_catalog.size > 0):
-            # We still have some valid sources left
-            nonsid_catalog = _nonsid_catalog
+            if (_nonsid_catalog.size > 0):
+                # We still have some valid sources left
+                nonsid_catalog = _nonsid_catalog
+            else:
+                # seelction above left no sources behind, so skip catalo pruning
+                pass
+
+
+            # pick the brightest source - that's very likely the asteroid
+            brightest = numpy.argmin(nonsid_catalog[:, SXcolumn['mag_aper_2.0']])
+            asteroid_coords = nonsid_catalog[brightest]
+            print asteroid_coords[:4]
         else:
-            # seelction above left no sources behind, so skip catalo pruning
-            pass
+            # This is the new, preferred way:
+            # Select the most central object
 
+            # get size of output frame
+            nsstack_hdu = pyfits.open(nonsidereal_stack_filename+".fits")
+            center = numpy.array(nsstack_hdu[0].data.shape)/2
+            
+            d_center = nonsid_catalog[:, SXcolumn['x']:SXcolumn['y']+1] - center
+            r_center = numpy.hypot(d_center[:,0], d_center[:,1])
+            print r_center
 
-        # pick the brightest source - that's very likely the asteroid
-        brightest = numpy.argmin(nonsid_catalog[:, SXcolumn['mag_aper_2.0']])
-        asteroid_coords = nonsid_catalog[brightest]
-        print asteroid_coords[:4]
+            most_central = numpy.argmin(r_center)
+            asteroid_coords = nonsid_catalog[most_central]
+
 
         #
         # Now we can also extract the profile for the asteroid
         #
-        asteroid = compute_mean_profile(filename=nonsidereal_stack_filename+".fits",
-                                        fxy_list=asteroid_coords[2:4].reshape((1,-1)), 
-                                        # we need x/y coords here 
-                                        mode='radial',
-                                        save_tmp=False,
-                                        )
+        ns_hdu = pyfits.open(nonsidereal_stack_filename+".fits")
+        data = ns_hdu[0].data
+        arcsec_per_pixel = ns_hdu[0].header['CD2_2'] * 3600
+   
+        r, f, nf = get_profile(data=data.T, 
+                         center_x=asteroid_coords[SXcolumn['x']], 
+                         center_y=asteroid_coords[SXcolumn['y']],
+                         mx=0, my=0, width=5.0/arcsec_per_pixel,
+                         mode='radial',
+                         normalize=False,
+                         )
+        r *= arcsec_per_pixel
+        max_intensity = nf
+        asteroid = numpy.append(r.reshape((-1,1)), f.reshape((-1,1)), axis=1)
+
+        # asteroid = compute_mean_profile(filename=nonsidereal_stack_filename+".fits",
+        #                                 fxy_list=asteroid_coords[2:4].reshape((1,-1)), 
+        #                                 # we need x/y coords here 
+        #                                 mode='radial',
+        #                                 save_tmp=False,
+        #                                 )
 
 
         #
         # Next we compute the synthetic PSF at the coordinates of the source
         #
-        asteroid_synth = psf_fit(asteroid[:,0])
+        asteroid_synth = psf_fit(asteroid[:,0]) * max_intensity
         #
         # Make a nice output file that contains the data, sf-fit, and difference
         #
@@ -346,16 +378,18 @@ Column 04: Asteroid flux - PSF flux
         plot_filename = "single_object__%05d.psfdiff.png" % (grpid)
         fig2 = matplotlib.pyplot.figure()
         ax2 = fig2.add_subplot(111)
+        ax2.set_title("Asteroid @ x=%.1f y=%.1f" % (asteroid_coords[SXcolumn['x']],
+                                                    asteroid_coords[SXcolumn['y']]))
         plot_x = numpy.linspace(numpy.min(stars_mirrored[:,0]), numpy.max(stars_mirrored[:,0]), 1000)
-        scale_match = 1.
+        scale_match = 1. * max_intensity
         difference = asteroid[:,1] - asteroid_synth
         ax2.scatter(asteroid[:,0], asteroid[:,1], marker=".")
-        ax2.scatter(asteroid[:,0], difference-0.2, marker="x")
+        ax2.scatter(asteroid[:,0], difference-0.2*nf, marker="x")
         ax2.plot(plot_x, psf_fit(plot_x)*scale_match, "r-", linewidth=3)
         ax2.set_xlim((0, numpy.max(base_points)))
-        ax2.set_ylim((-0.4, 1.2))
+        ax2.set_ylim((-0.4*max_intensity, 1.2*max_intensity))
         ax2.axhline(color='#80ff80', linewidth=3)
-        ax2.axhline(y=-0.2, color='#8080ff', linewidth=3)
+        ax2.axhline(y=-0.2*max_intensity, color='#8080ff', linewidth=3)
         ax2.set_xlabel("Radius [arcsec]")
         ax2.set_ylabel("Intensity [flux-normalized counts]")
         #fig2.show()
@@ -404,7 +438,9 @@ if __name__ == "__main__":
             logger.error("There was a problem processing %d" % (grpid))
             pass
 
-        if (idx > 25):
+        #break
+
+        if (idx > 15):
             break
 
     podi_logging.shutdown_logging(options)
