@@ -41,7 +41,7 @@ def run_swarp(input_list, outputimage, combine="MEDIAN"):
         'swarp_default': "/work/podi_devel/.config/swarp.default",
         'img_out': "%s.fits" % (outputimage),
         'img_w_out': "%s.weight.fits" % (outputimage),
-        'resample_dir': "/scratch/", 
+        'resample_dir': sitesetup.scratch_dir,
         'inputfile': " ".join(input_list),
         'combinetype': combine.upper(),
     }
@@ -146,6 +146,10 @@ if __name__ == "__main__":
         run_swarp(input_list=out_mef, 
                   outputimage="single_object__%05d.stack" % (grpid),
                   combine='average'
+        )
+        run_swarp(input_list=out_mef, 
+                  outputimage="single_object__%05d.siderealstack" % (grpid),
+                  combine='median'
         )
 
 
