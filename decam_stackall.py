@@ -317,6 +317,24 @@ def do_work(hdulist, grpids, grpid):
         # Next we compute the synthetic PSF at the coordinates of the source
         #
         asteroid_synth = psf_fit(asteroid[:,0])
+        #
+        # Make a nice output file that contains the data, sf-fit, and difference
+        #
+        output_buffer = numpy.empty((asteroid.shape[0], 4))
+        output_buffer[:,0:2] = asteroid[:]
+        output_buffer[:,2] = asteroid_synth[:]
+        output_buffer[:,3] = asteroid[:,1] - asteroid_synth[:]
+        psf_sub_filename = "single_object__%05d.psfsub.dat" % (grpid)
+        numpy.savetxt(psf_sub_filename,
+                      output_buffer,
+                      header="""\
+Column 01: Radius in arcsec
+Column 02: Normalized flux
+Column 03: Average PSF profile, normalized
+Column 04: Asteroid flux - PSF flux
+-------------------""",
+                  )
+
         numpy.savetxt("asteroid.dat", 
                       numpy.append(asteroid,
                                    asteroid_synth.reshape((-1,1)), axis=1))
@@ -382,6 +400,7 @@ if __name__ == "__main__":
         try:
             do_work(hdulist, grpids, grpid)
         except:
+            podi_logging.log_exception()
             logger.error("There was a problem processing %d" % (grpid))
             pass
 
