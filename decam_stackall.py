@@ -8,8 +8,13 @@ sys.path.append(qr_dir)
 
 import podi_swarpstack
 from podi_commandline import *
+from podi_definitions import *
 import podi_logging
 import podi_sitesetup as sitesetup
+
+from profile import *
+from meanprofile import compute_mean_profile
+from compare_profiles import *
 
 wcs_headers = [
     'CRVAL1', 'CRVAL2',
@@ -22,6 +27,8 @@ del_headers = ['COMAG']
 
 
 def run_swarp(input_list, outputimage, combine="MEDIAN"):
+
+    logger = logging.getLogger("Swarp")
 
     #
     #
@@ -90,6 +97,255 @@ def run_swarp(input_list, outputimage, combine="MEDIAN"):
 
     return
 
+
+def do_work(hdulist, grpids, grpid):
+
+    logger = logging.getLogger("Worker(%05d)" % (grpid))
+
+    if (True):
+        print grpids[grpid]
+        
+        out_mef = "single_object__%05d.sidereal.fits" % (grpid)
+        out_mef_nonsid = "single_object__%05d.nonsid.fits" % (grpid)
+
+        out_hdulist = [hdulist[0]]
+        for single_epoch_extname in grpids[grpid]:
+            out_hdulist.append(hdulist[single_epoch_extname])
+            
+        # convert list of extensions into MEF
+        out_hdulist = pyfits.HDUList(out_hdulist)
+
+        # Now make every image self-contained by copying and inserting 
+        # all WCS-relevant headers from the primary header
+        for ext in out_hdulist[1:]:
+            for hdrname in wcs_headers:
+                if hdrname in out_hdulist[0].header:
+                    ext.header[hdrname] = out_hdulist[0].header[hdrname]
+
+        clobberfile(out_mef)
+        out_hdulist.writeto(out_mef, clobber=True, output_verify='silentfix')
+
+        sidereal_stack = "single_object__%05d.siderealstack" % (grpid)
+        run_swarp(input_list=out_mef, 
+                  outputimage="single_object__%05d.stack" % (grpid),
+                  combine='average'
+        )
+        run_swarp(input_list=out_mef, 
+                  outputimage=sidereal_stack,
+                  combine='median'
+        )
+
+
+        #
+        # Now modify the FITS file to yield the non-sidereal stack
+        # This requires to change the WCS headers to make the asteroid appear 
+        # at the same sky-position in all individual frames
+        # Since CRVALi are already identifical for all images, make the CRPIXi
+        # match as well
+        #
+        
+        # Read the CRPIXi headers from extension 1 (the first actual image ext)
+        crpix_keys = ['CRPIX1', 'CRPIX2']
+        crpix_ref = numpy.zeros((2))
+        for idx, key in enumerate(crpix_keys):
+            crpix_ref[idx] = out_hdulist[1].header[key]
+        
+        # and insert into all other ImageHDUs
+        for ext in out_hdulist[2:]:
+            for idx, key in enumerate(crpix_keys):
+                ext.header[key] = crpix_ref[idx]
+
+        # Save the modified HDUList as a sidereal stack
+        clobberfile(out_mef_nonsid)
+        out_hdulist.writeto(out_mef_nonsid, clobber=True)
+
+        nonsidereal_stack_filename = "single_object__%05d.nonsidstack" % (grpid)
+        run_swarp(input_list=out_mef_nonsid, 
+                  outputimage=nonsidereal_stack_filename,
+                  combine='median'
+        )
+
+
+        #
+        # Now run SourceExtractor on the sidereal median stack to get a catalog 
+        # of stars we can use to model the PSF 
+        #
+        sidereal_cat_filename = "single_object__%05d.sidereal.cat" % (grpid)
+        sex_cmd = """
+            %(sex)s -c %(qr_base)s/.config/wcsfix.sex 
+            -PARAMETERS_NAME %(qr_base)s/.config/wcsfix.sexparam
+            -CATALOG_NAME %(catfile)s
+            -WEIGHT_TYPE MAP_WEIGHT
+            -WEIGHT_IMAGE %(siderealstack)s.weight.fits
+            %(siderealstack)s.fits """ % {
+                'sex': sitesetup.sextractor,
+                'qr_base': qr_dir,
+                'catfile': sidereal_cat_filename,
+                'siderealstack': "single_object__%05d.siderealstack" % (grpid),
+            }
+        print " ".join(sex_cmd.split())
+        os.system(" ".join(sex_cmd.split()))
+
+
+        #
+        # Load the catalog
+        #
+        catalog = numpy.loadtxt(sidereal_cat_filename)
+        print "catalog shape:", catalog.shape
+        if (catalog.shape[0] == 0):
+            logger.critical("no stars found!")
+            return
+        elif (catalog.ndim == 1):
+            logger.warning("Only one source found!")
+            catalog = catalog.reshape((1, -1))
+
+        # Now exclude all sources we consider not useful
+        elongated = catalog[:, SXcolumn['elongation']] > 1.5
+        bad_photometry = catalog[:, SXcolumn['mag_aper_2.0']] > 50.
+        flagged = (catalog[:, SXcolumn['flags']].astype(numpy.int8) & 0b00001111) > 0
+        faint = catalog[:, SXcolumn['flux_max']] < 250.
+        # excludes 
+        # - near neighbors, 
+        # - deblended sources, 
+        # - saturated, 
+        # - truncated (next to image boundary)
+        bad_source = elongated | bad_photometry | flagged | faint
+        catalog = catalog[~bad_source]
+
+        numpy.savetxt(sys.stdout, catalog[:,:4], "%.5f")
+
+        # Now compute mean profile for all stars combined
+        stars = compute_mean_profile(filename=sidereal_stack+".fits",
+                                     fxy_list=catalog[:, 2:4], 
+                                     # we need x/y coords here 
+                                     mode='radial',
+                                     save_tmp=False,
+        )
+        print stars.shape
+        all_profiles_filename = "single_object__%05d.sidereal.prof" % (grpid)
+        numpy.savetxt(all_profiles_filename, stars)
+
+        # Add a mirrored profile to make sure we get a symmetric profile and 
+        # to avoid potentialissues at radius 0
+        stars_mirrored = numpy.append((stars * numpy.array([-1.,1.]))[::-1],
+                                      stars,
+                                      axis=0)
+        numpy.savetxt("mirrored", stars_mirrored)
+
+        #
+        # Fit the profile with a spline - use radii up to 4.8 arcsec
+        #
+        #base_points = numpy.linspace(-4.8,4.8,200)
+        base_points = numpy.linspace(-3., 3., 90)
+        psf_fit = scipy.interpolate.LSQUnivariateSpline(
+            stars_mirrored[:,0], stars_mirrored[:,1],
+            t=base_points,
+            k=3)
+
+        # save some data for plotting/debugging
+        numpy.savetxt("fit.dump", numpy.append(base_points.reshape((-1,1)),
+                                               psf_fit(base_points).reshape((-1,1)),
+                                               axis=1))
+        
+        #
+        # Now we have the full reference star PSF profile, so we can extract 
+        # the profile of the actual moving target and compare them
+        #
+        # For now assume spherical symmetry as well for the asteroid
+        #
+
+        # Run source extractor on the median-filtered nonsidereal stack to get 
+        # the position of the moving target
+        nonsidereal_cat_filename = "single_object__%05d.nonsidereal.cat" % (grpid)
+        sex_cmd = """
+            %(sex)s -c %(qr_base)s/.config/wcsfix.sex 
+            -PARAMETERS_NAME %(qr_base)s/.config/wcsfix.sexparam
+            -CATALOG_NAME %(catfile)s
+            -WEIGHT_TYPE MAP_WEIGHT
+            -WEIGHT_IMAGE %(nonsiderealstack)s.weight.fits
+            %(nonsiderealstack)s.fits """ % {
+                'sex': sitesetup.sextractor,
+                'qr_base': qr_dir,
+                'catfile': nonsidereal_cat_filename,
+                'nonsiderealstack': nonsidereal_stack_filename
+            }
+        print " ".join(sex_cmd.split())
+        os.system(" ".join(sex_cmd.split()))
+
+        # As above, load the catalog
+        nonsid_catalog = numpy.loadtxt(nonsidereal_cat_filename)
+        print "catalog shape:", nonsid_catalog.shape
+        if (nonsid_catalog.shape[0] == 0):
+            logger.critical("no stars found in non-sidereal catalog!")
+            return
+        elif (nonsid_catalog.ndim == 1):
+            logger.warning("Only one source found in non-sidereal catalog!")
+            nonsid_catalog = nonsid_catalog.reshape((1, -1))
+
+        elongated = nonsid_catalog[:, SXcolumn['elongation']] > 1.5
+        bad_photometry = nonsid_catalog[:, SXcolumn['mag_aper_2.0']] > 50.
+        flagged = nonsid_catalog[:, SXcolumn['flags']].astype(numpy.int8) > 0
+        bad = elongated | bad_photometry | flagged
+        _nonsid_catalog = nonsid_catalog[~bad]
+        print _nonsid_catalog
+
+        if (_nonsid_catalog.size > 0):
+            # We still have some valid sources left
+            nonsid_catalog = _nonsid_catalog
+        else:
+            # seelction above left no sources behind, so skip catalo pruning
+            pass
+
+
+        # pick the brightest source - that's very likely the asteroid
+        brightest = numpy.argmin(nonsid_catalog[:, SXcolumn['mag_aper_2.0']])
+        asteroid_coords = nonsid_catalog[brightest]
+        print asteroid_coords[:4]
+
+        #
+        # Now we can also extract the profile for the asteroid
+        #
+        asteroid = compute_mean_profile(filename=nonsidereal_stack_filename+".fits",
+                                        fxy_list=asteroid_coords[2:4].reshape((1,-1)), 
+                                        # we need x/y coords here 
+                                        mode='radial',
+                                        save_tmp=False,
+                                        )
+
+
+        #
+        # Next we compute the synthetic PSF at the coordinates of the source
+        #
+        asteroid_synth = psf_fit(asteroid[:,0])
+        numpy.savetxt("asteroid.dat", 
+                      numpy.append(asteroid,
+                                   asteroid_synth.reshape((-1,1)), axis=1))
+
+
+        #
+        # Make a second plot showing the data, reference psf, and difference
+        #
+        plot_filename = "single_object__%05d.psfdiff.png" % (grpid)
+        fig2 = matplotlib.pyplot.figure()
+        ax2 = fig2.add_subplot(111)
+        plot_x = numpy.linspace(numpy.min(stars_mirrored[:,0]), numpy.max(stars_mirrored[:,0]), 1000)
+        scale_match = 1.
+        difference = asteroid[:,1] - asteroid_synth
+        ax2.scatter(asteroid[:,0], asteroid[:,1], marker=".")
+        ax2.scatter(asteroid[:,0], difference-0.2, marker="x")
+        ax2.plot(plot_x, psf_fit(plot_x)*scale_match, "r-", linewidth=3)
+        ax2.set_xlim((0, numpy.max(base_points)))
+        ax2.set_ylim((-0.4, 1.2))
+        ax2.axhline(color='#80ff80', linewidth=3)
+        ax2.axhline(y=-0.2, color='#8080ff', linewidth=3)
+        ax2.set_xlabel("Radius [arcsec]")
+        ax2.set_ylabel("Intensity [flux-normalized counts]")
+        #fig2.show()
+        fig2.savefig(plot_filename)
+        #matplotlib.pyplot.show()
+
+
+
 if __name__ == "__main__":
 
     options = podi_logging.setup_logging()
@@ -122,70 +378,14 @@ if __name__ == "__main__":
     # Now go through each GRPID, and extract the relevant extensions to a separate file
     print "Extracting and stacking individual objects"
     for idx, grpid in enumerate(grpids):
-        print grpids[grpid]
-        
-        out_mef = "single_object__%05d.sidereal.fits" % (grpid)
-        out_mef_nonsid = "single_object__%05d.nonsid.fits" % (grpid)
 
-        out_hdulist = [hdulist[0]]
-        for single_epoch_extname in grpids[grpid]:
-            out_hdulist.append(hdulist[single_epoch_extname])
-            
-        # convert list of extensions into MEF
-        out_hdulist = pyfits.HDUList(out_hdulist)
+        try:
+            do_work(hdulist, grpids, grpid)
+        except:
+            logger.error("There was a problem processing %d" % (grpid))
+            pass
 
-        # Now make every image self-contained by copying and inserting 
-        # all WCS-relevant headers from the primary header
-        for ext in out_hdulist[1:]:
-            for hdrname in wcs_headers:
-                if hdrname in out_hdulist[0].header:
-                    ext.header[hdrname] = out_hdulist[0].header[hdrname]
-
-        clobberfile(out_mef)
-        out_hdulist.writeto(out_mef, clobber=True, output_verify='silentfix')
-
-        run_swarp(input_list=out_mef, 
-                  outputimage="single_object__%05d.stack" % (grpid),
-                  combine='average'
-        )
-        run_swarp(input_list=out_mef, 
-                  outputimage="single_object__%05d.siderealstack" % (grpid),
-                  combine='median'
-        )
-
-
-        #
-        # Now modify the FITS file to yield the non-sidereal stack
-        # This requires to change the WCS headers to make the asteroid appear 
-        # at the same sky-position in all individual frames
-        # Since CRVALi are already identifical for all images, make the CRPIXi
-        # match as well
-        #
-        
-        # Read the CRPIXi headers from extension 1 (the first actual image ext)
-        crpix_keys = ['CRPIX1', 'CRPIX2']
-        crpix_ref = numpy.zeros((2))
-        for idx, key in enumerate(crpix_keys):
-            crpix_ref[idx] = out_hdulist[1].header[key]
-        
-        # and insert into all other ImageHDUs
-        for ext in out_hdulist[2:]:
-            for idx, key in enumerate(crpix_keys):
-                ext.header[key] = crpix_ref[idx]
-
-        # Save the modified HDUList as a sidereal stack
-        clobberfile(out_mef_nonsid)
-        out_hdulist.writeto(out_mef_nonsid, clobber=True)
-
-        run_swarp(input_list=out_mef_nonsid, 
-                  outputimage="single_object__%05d.nonsidstack" % (grpid),
-                  combine='median'
-        )
-
-
-        break
-
-        if (idx > 5):
+        if (idx > 25):
             break
 
     podi_logging.shutdown_logging(options)
