@@ -11,6 +11,7 @@ from podi_commandline import *
 from podi_definitions import *
 import podi_logging
 import podi_sitesetup as sitesetup
+from astLib import astWCS
 
 from profile import *
 from meanprofile import compute_mean_profile
@@ -145,15 +146,45 @@ def do_work(hdulist, grpids, grpid):
         #
         
         # Read the CRPIXi headers from extension 1 (the first actual image ext)
-        crpix_keys = ['CRPIX1', 'CRPIX2']
-        crpix_ref = numpy.zeros((2))
-        for idx, key in enumerate(crpix_keys):
-            crpix_ref[idx] = out_hdulist[1].header[key]
+        ref_wcs = astWCS.WCS(out_hdulist[1].header, mode='pyfits')
+        ref_x = out_hdulist[1].header['COPX']
+        ref_y = out_hdulist[1].header['COPY']
+        ref_radec = numpy.array(ref_wcs.pix2wcs(ref_x, ref_y))
+#        print ast_radec
+#        crpix_keys = ['CRPIX1', 'CRPIX2']
+#        crpix_ref = numpy.zeros((2))
+#        for idx, key in enumerate(crpix_keys):
+#            crpix_ref[idx] = out_hdulist[1].header[key]
         
         # and insert into all other ImageHDUs
         for ext in out_hdulist[2:]:
-            for idx, key in enumerate(crpix_keys):
-                ext.header[key] = crpix_ref[idx]
+            # Work out Ra/dec of the asteroid in the i-th frame
+            _x = ext.header['COPX']
+            _y = ext.header['COPY']
+            ast_wcs = astWCS.WCS(ext.header, mode='pyfits')
+            _radec = numpy.array(ast_wcs.pix2wcs(_x, _y))
+            print _radec
+
+            # now compute the difference between the ref. position and the 
+            # actual position
+            d_motion = _radec - ref_radec
+            print "Delta_RADEC=",d_motion*3600
+
+            # And finally apply the shift to the CRVAL values
+            ext.header['CRVAL1'] -= d_motion[0]
+            ext.header['CRVAL2'] -= d_motion[1]
+            
+            # Check positions
+            new_wcs = astWCS.WCS(ext.header, mode='pyfits')
+            new_radec = numpy.array(new_wcs.pix2wcs(_x, _y))
+            print "OLD/NEW:", ref_radec, new_radec, (ref_radec-new_radec)*3600.
+
+#            ast_xy = ast_wcs.wcs2pix(ast_radec[0], ast_radec[1])
+#            print ":XXX:", ast_xy
+
+
+            # for idx, key in enumerate(crpix_keys):
+            #     ext.header[key] = crpix_ref[idx]
 
         # Save the modified HDUList as a sidereal stack
         clobberfile(out_mef_nonsid)
@@ -430,7 +461,6 @@ if __name__ == "__main__":
     # Now go through each GRPID, and extract the relevant extensions to a separate file
     print "Extracting and stacking individual objects"
     for idx, grpid in enumerate(grpids):
-
         try:
             do_work(hdulist, grpids, grpid)
         except:
@@ -438,9 +468,8 @@ if __name__ == "__main__":
             logger.error("There was a problem processing %d" % (grpid))
             pass
 
-        #break
-
-        if (idx > 15):
+        break
+        if (idx > 5):
             break
 
     podi_logging.shutdown_logging(options)
